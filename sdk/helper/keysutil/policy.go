@@ -104,6 +104,11 @@ type BackupInfo struct {
 	Version int       `json:"version"`
 }
 
+type SharedSecretDerivationOptions struct {
+	KeyAgreementAlgorithm string
+	PublicKey             any // public key with a type from x509.ParsePKIXPublicKey
+}
+
 type SigningOptions struct {
 	HashAlgorithm    HashType
 	Marshaling       MarshalingType
@@ -194,6 +199,14 @@ func (kt KeyType) HMACSupported() bool {
 func (kt KeyType) ImportPublicKeySupported() bool {
 	switch kt {
 	case KeyType_RSA2048, KeyType_RSA3072, KeyType_RSA4096, KeyType_ECDSA_P256, KeyType_ECDSA_P384, KeyType_ECDSA_P521, KeyType_ED25519:
+		return true
+	}
+	return false
+}
+
+func (kt KeyType) SharedSecretDerivationSupported() bool {
+	switch kt {
+	case KeyType_ECDSA_P256, KeyType_ECDSA_P384, KeyType_ECDSA_P521:
 		return true
 	}
 	return false
@@ -901,6 +914,87 @@ func (p *Policy) DeriveKey(context, salt []byte, ver int, numBytes int) ([]byte,
 
 	default:
 		return nil, errutil.InternalError{Err: "unsupported key derivation mode"}
+	}
+}
+
+func (p *Policy) DeriveSharedSecret(ver int, options *SharedSecretDerivationOptions) ([]byte, error) {
+	if !p.Type.SharedSecretDerivationSupported() {
+		return nil, errutil.UserError{Err: fmt.Sprintf("shared secret derivation not supported for key type %v", p.Type)}
+	}
+
+	if p.Keys == nil || p.LatestVersion == 0 {
+		return nil, errutil.InternalError{Err: "unable to access the key; no key versions found"}
+	}
+
+	switch {
+	case ver == 0:
+		ver = p.LatestVersion
+	case ver < 0:
+		return nil, errutil.UserError{Err: "requested version for shared secret derivation is negative"}
+	case ver > p.LatestVersion:
+		return nil, errutil.UserError{Err: "requested version for shared secret derivation is higher than the latest key version"}
+	case ver < p.MinAvailableVersion:
+		return nil, errutil.UserError{Err: "requested version for shared secret derivation is less than the minimum available key version"}
+	}
+
+	keyEntry, err := p.safeGetKeyEntry(ver)
+	if err != nil {
+		return nil, err
+	}
+
+	switch p.Type {
+	case KeyType_ECDSA_P256, KeyType_ECDSA_P384, KeyType_ECDSA_P521:
+		if options.KeyAgreementAlgorithm != "ecdh" {
+			return nil, errutil.UserError{Err: fmt.Sprintf("key type %v not compatible with algorithm", p.Type)}
+		}
+
+		var curve elliptic.Curve
+		switch p.Type {
+		case KeyType_ECDSA_P384:
+			curve = elliptic.P384()
+		case KeyType_ECDSA_P521:
+			curve = elliptic.P521()
+		default:
+			curve = elliptic.P256()
+		}
+
+		managedPrivateKey := &ecdsa.PrivateKey{
+			PublicKey: ecdsa.PublicKey{
+				Curve: curve,
+				X:     keyEntry.EC_X,
+				Y:     keyEntry.EC_Y,
+			},
+			D: keyEntry.EC_D,
+		}
+
+		providedPublicKey, ok := options.PublicKey.(*ecdsa.PublicKey)
+		if !ok {
+			return nil, errutil.UserError{Err: fmt.Sprintf("key type %v not compatible with public key", p.Type)}
+		}
+
+		if providedPublicKey.Curve != managedPrivateKey.Curve {
+			return nil, errutil.UserError{Err: fmt.Sprintf("key type %v does not match public key curve", p.Type)}
+		}
+
+		privateKeyEcdh, err := managedPrivateKey.ECDH()
+		if err != nil {
+			return nil, errutil.InternalError{Err: err.Error()}
+		}
+
+		publicKeyEcdh, err := providedPublicKey.ECDH()
+		if err != nil {
+			return nil, errutil.InternalError{Err: err.Error()}
+		}
+
+		sharedSecret, err := privateKeyEcdh.ECDH(publicKeyEcdh)
+		if err != nil {
+			return nil, errutil.InternalError{Err: err.Error()}
+		}
+
+		return sharedSecret, nil
+
+	default:
+		return nil, errutil.InternalError{Err: "unsupported key type for shared secret derivation"}
 	}
 }
 
